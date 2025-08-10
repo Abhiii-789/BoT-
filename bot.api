@@ -1,0 +1,122 @@
+const fs = require('fs');
+const readline = require('readline');
+const login = require('ws3-fca'); // नई API
+
+// उपयोगकर्ता से इनपुट लेने का फंक्शन
+const getInput = (query) => {
+    const rl = readline.createInterface({
+        input: process.stdin,
+        output: process.stdout,
+    });
+
+    return new Promise((resolve) => rl.question(query, (answer) => {
+        rl.close();
+        resolve(answer);
+    }));
+};
+
+// मुख्य फंक्शन
+(async () => {
+    console.log("\n🚀 Termux Messenger Bot: Group Name & Nickname Lock Script\n");
+
+    // उपयोगकर्ता से इनपुट लें
+    const appstatePath = await getInput('🔑 अपना appstate.json फ़ाइल का पथ दर्ज करें: ');
+    const prefix = await getInput('✏ कमांड के लिए प्रिफिक्स दर्ज करें (जैसे, *): ');
+    const adminID = await getInput('👑 अपना एडमिन आईडी दर्ज करें: ');
+
+    // Appstate JSON लोड करें
+    let appState;
+    try {
+        appState = JSON.parse(fs.readFileSync(appstatePath, 'utf8'));
+    } catch (err) {
+        console.error('❌ Appstate JSON फ़ाइल नहीं मिली या यह अमान्य है।');
+        process.exit(1);
+    }
+
+    // ws3-fca से लॉगिन करें
+    login({ appState }, (err, api) => {
+        if (err) return console.error('❌ लॉगिन विफल:', err);
+
+        console.log('\n✅ बॉट चल रहा है और कमांड सुन रहा है...');
+        api.setOptions({ listenEvents: true });
+
+        const lockedGroups = {}; // गुप नाम ट्रैक करने के लिए
+        const lockedNicknames = {}; // निकनेम ट्रैक करने के लिए
+
+        api.listenMqtt((err, event) => {
+            if (err) return console.error('❌ सुनने में त्रुटि:', err);
+
+            if (event.type === 'message' && event.body.startsWith(prefix)) {
+                const senderID = event.senderID;
+                const args = event.body.slice(prefix.length).trim().split(' ');
+                const command = args[0].toLowerCase();
+                const groupName = args.slice(2).join(' ');
+
+                // केवल एडमिन ही कमांड चला सकता है
+                if (senderID !== adminID) {
+                    return api.sendMessage('❌ आपको यह कमांड चलाने की अनुमति नहीं है।', event.threadID);
+                }
+
+                // गुप नाम लॉक करें
+                if (command === 'grouplockname' && args[1] === 'on') {
+                    lockedGroups[event.threadID] = groupName;
+                    api.setTitle(groupName, event.threadID, (err) => {
+                        if (err) return api.sendMessage('❌ गुप का नाम लॉक करने में विफल।', event.threadID);
+                        api.sendMessage(`✅ गुप का नाम लॉक किया गया: ${groupName}`, event.threadID);
+                    });
+                }
+
+                // निकनेम लॉक करें
+                else if (command === 'nicknamelock' && args[1] === 'on') {
+                    const nickname = groupName;
+
+                    api.getThreadInfo(event.threadID, (err, info) => {
+                        if (err) return console.error('❌ गुप जानकारी लाने में त्रुटि:', err);
+
+                        const delay = 2000; // हर यूज़र पर 2 सेकंड का डिले
+                        info.participantIDs.forEach((userID, index) => {
+                            setTimeout(() => {
+                                api.changeNickname(nickname, event.threadID, userID, (err) => {
+                                    if (err) console.error(`❌ यूज़र ${userID} के लिए निकनेम सेट करने में विफल:`, err);
+                                });
+                            }, index * delay);
+                        });
+
+                        // निकनेम लॉक करें
+                        lockedNicknames[event.threadID] = nickname;
+                        api.sendMessage(`✅ सभी निकनेम लॉक किए गए: ${nickname}`, event.threadID);
+                    });
+                }
+
+                // लॉक स्टेटस देखें
+                else if (command === 'lockstatus') {
+                    const lockStatus = `🔒 लॉक स्टेटस:\nगुप का नाम: ${
+                        lockedGroups[event.threadID] || 'लॉक नहीं है'
+                    }\nनिकनेम: ${lockedNicknames[event.threadID] || 'लॉक नहीं है'}`;
+                    api.sendMessage(lockStatus, event.threadID);
+                }
+            }
+
+            // बाहरी गुप नाम बदलने से रोकें
+            if (event.logMessageType === 'log:thread-name') {
+                const lockedName = lockedGroups[event.threadID];
+                if (lockedName) {
+                    api.setTitle(lockedName, event.threadID, (err) => {
+                        if (!err) api.sendMessage('❌ गुप का नाम बदलना रद्द किया गया।', event.threadID);
+                    });
+                }
+            }
+
+            // बाहरी निकनेम बदलने से रोकें
+            if (event.logMessageType === 'log:thread-nickname') {
+                const lockedNickname = lockedNicknames[event.threadID];
+                if (lockedNickname) {
+                    const affectedUserID = event.logMessageData.participant_id;
+                    api.changeNickname(lockedNickname, event.threadID, affectedUserID, (err) => {
+                        if (!err) api.sendMessage('❌ निकनेम बदलना रद्द किया गया।', event.threadID);
+                    });
+                }
+            }
+        });
+    });
+})();
